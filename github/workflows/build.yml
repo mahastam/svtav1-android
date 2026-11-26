@@ -1,0 +1,683 @@
+name: Build SVT-AV1 Android App (arm64 / Snapdragon 865)
+
+on:
+  workflow_dispatch:
+    inputs:
+      svt_tag:
+        description: "SVT-AV1 tag (GitLab)"
+        default: "v4.3.0"
+        required: true
+        type: string
+      ffmpeg_ref:
+        description: "FFmpeg branch or tag (GitHub mirror)"
+        default: "master"
+        required: true
+        type: string
+      fdk_tag:
+        description: "fdk-aac tag"
+        default: "v2.0.3"
+        required: true
+        type: string
+
+env:
+  SVT_TAG: ${{ inputs.svt_tag || 'v4.3.0' }}
+  FFMPEG_REF: ${{ inputs.ffmpeg_ref || 'master' }}
+  FDK_TAG: ${{ inputs.fdk_tag || 'v2.0.3' }}
+  NDK_VERSION: "27.2.12479018"
+  API_LEVEL: "29"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Install host tools and Android SDK/NDK
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config cmake make git perl nasm
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}" >/dev/null || true
+          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          test -d "$NDK"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          test -x "$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
+          {
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "NDK=$NDK"
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "PREFIX=$GITHUB_WORKSPACE/deps"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/deps"
+
+      - name: Build SVT-AV1 (static, arm64-v8a)
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$SVT_TAG" https://gitlab.com/AOMediaCodec/SVT-AV1.git svt-src
+          cmake -S svt-src -B svt-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${API_LEVEL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_APPS=OFF \
+            -DBUILD_DEC=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build svt-build -j"$(nproc)"
+          cmake --install svt-build
+          ls -l "$PREFIX/lib" "$PREFIX/lib/pkgconfig"
+          sed -i 's/-lpthread//g' "$PREFIX"/lib/pkgconfig/SvtAv1Enc.pc
+          cat "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc"
+
+      - name: Build fdk-aac (HE-AAC v2 encoder)
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$FDK_TAG" https://github.com/mstorsjo/fdk-aac.git fdk-src
+          cmake -S fdk-src -B fdk-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${API_LEVEL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_PROGRAMS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build fdk-build -j"$(nproc)"
+          cmake --install fdk-build
+          ls -l "$PREFIX/lib" "$PREFIX/lib/pkgconfig"
+          sed -i 's/-lpthread//g; s/-lstdc++//g' "$PREFIX"/lib/pkgconfig/fdk-aac.pc
+          cat "$PREFIX/lib/pkgconfig/fdk-aac.pc"
+
+      - name: Build FFmpeg (libsvtav1 + libfdk_aac) as executable
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          export CC="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang++"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+          ./configure \
+            --prefix="$PWD/../ffout" \
+            --enable-cross-compile \
+            --target-os=android \
+            --arch=aarch64 \
+            --cc="$CC" \
+            --cxx="$CXX" \
+            --ar="$TOOLCHAIN/bin/llvm-ar" \
+            --nm="$TOOLCHAIN/bin/llvm-nm" \
+            --ranlib="$TOOLCHAIN/bin/llvm-ranlib" \
+            --strip="$TOOLCHAIN/bin/llvm-strip" \
+            --pkg-config=pkg-config \
+            --pkg-config-flags="--static" \
+            --disable-autodetect \
+            --enable-zlib \
+            --enable-nonfree \
+            --enable-libsvtav1 \
+            --enable-libfdk-aac \
+            --enable-pic \
+            --enable-static \
+            --disable-shared \
+            --disable-doc \
+            --disable-debug \
+            --disable-ffplay \
+            --disable-ffprobe \
+            --extra-cflags="-I$PREFIX/include -fPIE" \
+            --extra-ldflags="-L$PREFIX/lib -pie -Wl,-z,max-page-size=16384" \
+            --extra-libs="-lc++_static -lc++abi -lm" \
+          || { echo "=== configure failed, ffbuild/config.log (tail) ==="; tail -n 80 ffbuild/config.log; exit 1; }
+          make -j"$(nproc)"
+          file ffmpeg
+          "$TOOLCHAIN/bin/llvm-readelf" -d ffmpeg | grep NEEDED || true
+          grep -aq "libsvtav1" ffmpeg
+          grep -aq "libfdk_aac" ffmpeg
+          mkdir -p "$GITHUB_WORKSPACE/androidapp/app/src/main/jniLibs/arm64-v8a"
+          cp ffmpeg "$GITHUB_WORKSPACE/androidapp/app/src/main/jniLibs/arm64-v8a/libffmpeg.so"
+          ls -l "$GITHUB_WORKSPACE/androidapp/app/src/main/jniLibs/arm64-v8a/"
+
+      - name: Generate Android project
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE/androidapp"
+          mkdir -p app/src/main/java/com/svtav1/encoder
+
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          cat > settings.gradle.kts <<'EOF_SETTINGS'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SvtAv1Encoder"
+          include(":app")
+          EOF_SETTINGS
+
+          cat > build.gradle.kts <<'EOF_ROOT'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF_ROOT
+
+          cat > gradle.properties <<'EOF_PROPS'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_PROPS
+
+          cat > app/build.gradle.kts <<'EOF_APP'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.svtav1.encoder"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.svtav1.encoder"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk {
+                      abiFilters.add("arm64-v8a")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                      keepDebugSymbols.add("**/libffmpeg.so")
+                  }
+              }
+
+              lint {
+                  abortOnError = false
+              }
+          }
+          EOF_APP
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF_MANIFEST'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:extractNativeLibs="true"
+                  android:label="SVT-AV1 Encoder"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|layoutDirection|locale">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_MANIFEST
+
+          cat > app/src/main/java/com/svtav1/encoder/MainActivity.kt <<'EOF_KOTLIN'
+          package com.svtav1.encoder
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.PowerManager
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.BufferedReader
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.io.InputStreamReader
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+
+              companion object {
+                  const val REQ_PICK = 100
+                  const val CRF_MIN = 1
+                  const val PRESET_MIN = 0
+                  const val AUDIO_MIN = 12
+              }
+
+              private var inputUri: Uri? = null
+              private var inputName: String = "video"
+
+              private lateinit var tvFile: TextView
+              private lateinit var sbCrf: SeekBar
+              private lateinit var sbPreset: SeekBar
+              private lateinit var spRes: Spinner
+              private lateinit var sbAudio: SeekBar
+              private lateinit var etExtra: EditText
+              private lateinit var btnStart: Button
+              private lateinit var btnCancel: Button
+              private lateinit var pbar: ProgressBar
+              private lateinit var tvStatus: TextView
+
+              @Volatile private var process: Process? = null
+              @Volatile private var cancelled = false
+              @Volatile private var running = false
+              private var wakeLock: PowerManager.WakeLock? = null
+
+              private val resNames = arrayOf("480 × 850", "720 × 1280", "1080 × 1920")
+              private val resW = intArrayOf(480, 720, 1080)
+              private val resH = intArrayOf(850, 1280, 1920)
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(16), dp(16), dp(16))
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+
+                  val tvTitle = TextView(this)
+                  tvTitle.text = "SVT-AV1 Encoder"
+                  tvTitle.textSize = 22f
+                  root.addView(tvTitle)
+
+                  val btnPick = Button(this)
+                  btnPick.text = "انتخاب ویدیو"
+                  btnPick.setOnClickListener { pickVideo() }
+                  root.addView(btnPick)
+
+                  tvFile = TextView(this)
+                  tvFile.text = "ویدیویی انتخاب نشده"
+                  root.addView(tvFile)
+
+                  sbCrf = addSeek(root, "CRF (کمتر = کیفیت بیشتر)", CRF_MIN, 63, 35) { it.toString() }
+                  sbPreset = addSeek(root, "Preset (0 کندترین و بهترین، 13 سریع‌ترین)", PRESET_MIN, 13, 8) { it.toString() }
+
+                  val tvRes = TextView(this)
+                  tvRes.text = "رزولوشن (حداکثر ابعاد، نسبت تصویر حفظ می‌شود)"
+                  tvRes.textSize = 15f
+                  tvRes.setPadding(0, dp(12), 0, 0)
+                  root.addView(tvRes)
+                  spRes = Spinner(this)
+                  val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, resNames)
+                  adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  spRes.adapter = adapter
+                  spRes.setSelection(1)
+                  root.addView(spRes)
+
+                  sbAudio = addSeek(root, "بیت‌ریت صدا (HE-AAC v2)", AUDIO_MIN, 48, 24) { it.toString() + " kbps" }
+
+                  val tvExtra = TextView(this)
+                  tvExtra.text = "پارامترهای پیشرفته SVT-AV1 (اختیاری)"
+                  tvExtra.textSize = 15f
+                  tvExtra.setPadding(0, dp(12), 0, 0)
+                  root.addView(tvExtra)
+                  etExtra = EditText(this)
+                  etExtra.hint = "tune=0:film-grain=8"
+                  etExtra.setSingleLine(true)
+                  etExtra.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  root.addView(etExtra)
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.setPadding(0, dp(12), 0, 0)
+                  btnStart = Button(this)
+                  btnStart.text = "شروع"
+                  btnCancel = Button(this)
+                  btnCancel.text = "لغو"
+                  btnCancel.isEnabled = false
+                  row.addView(btnStart, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(btnCancel, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(row)
+
+                  btnStart.setOnClickListener { startEncode() }
+                  btnCancel.setOnClickListener {
+                      cancelled = true
+                      process?.destroy()
+                  }
+
+                  pbar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  pbar.max = 1000
+                  root.addView(pbar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  tvStatus = TextView(this)
+                  tvStatus.textSize = 14f
+                  tvStatus.setTextIsSelectable(true)
+                  tvStatus.text = "آماده"
+                  root.addView(tvStatus)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun addSeek(root: LinearLayout, title: String, min: Int, max: Int, init: Int, fmt: (Int) -> String): SeekBar {
+                  val tv = TextView(this)
+                  tv.textSize = 15f
+                  tv.setPadding(0, dp(12), 0, 0)
+                  tv.text = title + ": " + fmt(init)
+                  val sb = SeekBar(this)
+                  sb.max = max - min
+                  sb.progress = init - min
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                          tv.text = title + ": " + fmt(progress + min)
+                      }
+                      override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                      override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                  })
+                  root.addView(tv)
+                  root.addView(sb)
+                  return sb
+              }
+
+              private fun pickVideo() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "video/*"
+                  startActivityForResult(i, REQ_PICK)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_PICK && resultCode == RESULT_OK) {
+                      val uri = data?.data ?: return
+                      inputUri = uri
+                      inputName = queryName(uri)
+                      tvFile.text = inputName
+                  }
+              }
+
+              private fun queryName(uri: Uri): String {
+                  var n = "video.mp4"
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (idx >= 0 && c.moveToFirst()) {
+                          n = c.getString(idx) ?: n
+                      }
+                  }
+                  return n
+              }
+
+              private fun setStatus(s: String) {
+                  runOnUiThread { tvStatus.text = s }
+              }
+
+              private fun setProgress(p: Int) {
+                  runOnUiThread { pbar.progress = p }
+              }
+
+              private fun finishUi() {
+                  runOnUiThread {
+                      btnStart.isEnabled = true
+                      btnCancel.isEnabled = false
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  }
+                  val wl = wakeLock
+                  if (wl != null && wl.isHeld) wl.release()
+                  running = false
+              }
+
+              private fun startEncode() {
+                  if (running) return
+                  val uri = inputUri
+                  if (uri == null) {
+                      Toast.makeText(this, "اول یک ویدیو انتخاب کن", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val crf = sbCrf.progress + CRF_MIN
+                  val preset = sbPreset.progress + PRESET_MIN
+                  val resIdx = spRes.selectedItemPosition
+                  val abr = sbAudio.progress + AUDIO_MIN
+                  val extra = etExtra.text.toString().trim()
+                  val name = inputName
+
+                  running = true
+                  cancelled = false
+                  btnStart.isEnabled = false
+                  btnCancel.isEnabled = true
+                  pbar.progress = 0
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "svtav1:encode")
+                  wl.acquire(6L * 60L * 60L * 1000L)
+                  wakeLock = wl
+
+                  Thread { encode(uri, name, crf, preset, resIdx, abr, extra) }.start()
+              }
+
+              private fun mb(bytes: Long): String =
+                  String.format(Locale.US, "%.1f MB", bytes / 1048576.0)
+
+              private fun encode(uri: Uri, name: String, crf: Int, preset: Int, resIdx: Int, abr: Int, extra: String) {
+                  val inFile = File(cacheDir, "input.bin")
+                  val outFile = File(cacheDir, "output.mp4")
+                  try {
+                      inFile.delete()
+                      outFile.delete()
+
+                      setStatus("در حال کپی ویدیو به حافظه موقت...")
+                      val ins = contentResolver.openInputStream(uri) ?: throw IOException("خواندن فایل ممکن نیست")
+                      ins.use { i -> FileOutputStream(inFile).use { o -> i.copyTo(o) } }
+                      if (cancelled) {
+                          setStatus("لغو شد.")
+                          return
+                      }
+                      val inSize = inFile.length()
+
+                      var vw = 0
+                      var vh = 0
+                      var rot = 0
+                      var durMs = 0L
+                      val mmr = MediaMetadataRetriever()
+                      try {
+                          mmr.setDataSource(inFile.absolutePath)
+                          vw = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                          vh = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                          rot = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                          durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                      } catch (e: Exception) {
+                          // metadata is optional; progress just won't show a percentage
+                      } finally {
+                          mmr.release()
+                      }
+                      if (rot == 90 || rot == 270) {
+                          val t = vw
+                          vw = vh
+                          vh = t
+                      }
+                      val landscape = vw > vh
+                      val boxW = if (landscape) resH[resIdx] else resW[resIdx]
+                      val boxH = if (landscape) resW[resIdx] else resH[resIdx]
+                      val vf = "scale=" + boxW + ":" + boxH + ":force_original_aspect_ratio=decrease:force_divisible_by=2"
+
+                      val ffmpeg = applicationInfo.nativeLibraryDir + "/libffmpeg.so"
+                      val cmd = ArrayList<String>()
+                      cmd.addAll(listOf(
+                          ffmpeg, "-y", "-hide_banner", "-nostdin",
+                          "-i", inFile.absolutePath,
+                          "-map", "0:v:0", "-map", "0:a:0?",
+                          "-vf", vf,
+                          "-c:v", "libsvtav1",
+                          "-preset", preset.toString(),
+                          "-crf", crf.toString(),
+                          "-pix_fmt", "yuv420p",
+                          "-g", "240"
+                      ))
+                      if (extra.isNotEmpty()) {
+                          cmd.addAll(listOf("-svtav1-params", extra))
+                      }
+                      cmd.addAll(listOf(
+                          "-c:a", "libfdk_aac",
+                          "-profile:a", "aac_he_v2",
+                          "-b:a", abr.toString() + "k",
+                          "-ac", "2",
+                          "-ar", "48000",
+                          "-movflags", "+faststart",
+                          "-progress", "pipe:1",
+                          "-nostats",
+                          outFile.absolutePath
+                      ))
+
+                      setStatus("در حال انکود...")
+                      val pb = ProcessBuilder(cmd)
+                      pb.redirectErrorStream(true)
+                      pb.directory(cacheDir)
+                      val p = pb.start()
+                      process = p
+
+                      val tail = ArrayList<String>()
+                      val kv = Regex("^[A-Za-z_0-9]+=.*")
+                      var speed = ""
+                      BufferedReader(InputStreamReader(p.inputStream)).use { br ->
+                          br.forEachLine { line ->
+                              if (line.startsWith("out_time_us=")) {
+                                  val us = line.substring(12).trim().toLongOrNull()
+                                  if (us != null && us >= 0L && durMs > 0L) {
+                                      val pr = ((us / 1000L) * 1000L / durMs).toInt().coerceIn(0, 1000)
+                                      setProgress(pr)
+                                      setStatus("در حال انکود: " + (pr / 10) + "%  " + speed)
+                                  }
+                              } else if (line.startsWith("speed=")) {
+                                  speed = "سرعت " + line.substring(6).trim()
+                              } else if (!kv.matches(line)) {
+                                  tail.add(line)
+                                  if (tail.size > 40) tail.removeAt(0)
+                              }
+                          }
+                      }
+                      val code = p.waitFor()
+                      process = null
+
+                      if (cancelled) {
+                          setStatus("لغو شد.")
+                          return
+                      }
+                      if (code != 0 || !outFile.exists() || outFile.length() == 0L) {
+                          setStatus("خطا (کد " + code + "):\n" + tail.takeLast(15).joinToString("\n"))
+                          return
+                      }
+
+                      setStatus("در حال ذخیره در گالری...")
+                      val base = name.substringBeforeLast('.', name).replace(Regex("[^\\p{L}\\p{N} _.-]"), "_")
+                      val outName = base + "_AV1_crf" + crf + "_p" + preset + ".mp4"
+                      val outSize = outFile.length()
+                      val ok = saveToGallery(outFile, outName)
+                      setProgress(1000)
+                      if (ok) {
+                          setStatus("تمام شد ✅\nذخیره شد در Movies/SVT-AV1\n" + outName + "\n" + mb(inSize) + "  ←  " + mb(outSize))
+                      } else {
+                          setStatus("انکود تمام شد ولی ذخیره در گالری شکست خورد.")
+                      }
+                  } catch (e: Exception) {
+                      setStatus("خطا: " + (e.message ?: e.toString()))
+                  } finally {
+                      process = null
+                      inFile.delete()
+                      outFile.delete()
+                      finishUi()
+                  }
+              }
+
+              private fun saveToGallery(file: File, displayName: String): Boolean {
+                  val values = ContentValues()
+                  values.put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                  values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                  values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/SVT-AV1")
+                  values.put(MediaStore.Video.Media.IS_PENDING, 1)
+                  val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                  val dst = contentResolver.insert(collection, values) ?: return false
+                  val os = contentResolver.openOutputStream(dst) ?: return false
+                  os.use { o -> FileInputStream(file).use { it.copyTo(o) } }
+                  val done = ContentValues()
+                  done.put(MediaStore.Video.Media.IS_PENDING, 0)
+                  contentResolver.update(dst, done, null, null)
+                  return true
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  process?.destroy()
+                  val wl = wakeLock
+                  if (wl != null && wl.isHeld) wl.release()
+              }
+          }
+          EOF_KOTLIN
+
+          find . -type f -not -name "libffmpeg.so" | sort
+
+      - name: Build APK
+        working-directory: androidapp
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Check APK contains ffmpeg
+        run: |
+          set -eux
+          APK="androidapp/app/build/outputs/apk/debug/app-debug.apk"
+          ls -l "$APK"
+          unzip -l "$APK" | grep "lib/arm64-v8a/libffmpeg.so"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SVT-AV1-Encoder-apk
+          path: androidapp/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
